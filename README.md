@@ -2,7 +2,7 @@
 
 utp (micro transport protocol) implementation in node with [dgram socket](https://nodejs.org/api/dgram.html#dgram_class_dgram_socket) compatibility. To install with npm:
 
-	npm install @QuixThe2nd/utp-socket
+	npm install QuixThe2nd/utp-socket
 
 ## What is utp?
 
