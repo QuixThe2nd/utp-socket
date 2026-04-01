@@ -68,6 +68,13 @@ var packetToBuffer = function(packet) {
 	return buffer;
 };
 
+var isUTPPacket = function(buffer) {
+	if (buffer.length < MIN_PACKET_SIZE) return false;
+	var id = buffer[0] & ID_MASK;
+	var ver = buffer[0] & 0x0f;
+	return ver === VERSION && (id === PACKET_DATA || id === PACKET_FIN || id === PACKET_STATE || id === PACKET_RESET || id === PACKET_SYN);
+};
+
 var createPacket = function(connection, id, data) {
 	return {
 		id: id,
@@ -82,10 +89,16 @@ var createPacket = function(connection, id, data) {
 	};
 };
 
-var Connection = function(port, host, socket, syn) {
-	Duplex.call(this);
+// ---------------------------------------------------------------------------
+// Connection
+// ---------------------------------------------------------------------------
+
+var Connection = function(port, host, socket, syn, allowHalfOpen) {
+	Duplex.call(this, { allowHalfOpen: allowHalfOpen !== false });
 	var self = this;
 
+	this.remotePort = port;
+	this.remoteAddress = host;
 	this.port = port;
 	this.host = host;
 	this.socket = socket;
@@ -93,6 +106,8 @@ var Connection = function(port, host, socket, syn) {
 	this._outgoing = cyclist(BUFFER_SIZE);
 	this._incoming = cyclist(BUFFER_SIZE);
 	this._closed = false;
+	this._contentSize = 0;
+	this._interactive = false;
 
 	this._inflightPackets = 0;
 	this._closed = false;
@@ -109,23 +124,16 @@ var Connection = function(port, host, socket, syn) {
 		this._transmit(this._synack);
 	} else {
 		this._connecting = true;
-		this._recvId = 0; // tmp value for v8 opt
-		this._sendId = 0; // tmp value for v8 opt
+		this._recvId = 0;
+		this._sendId = 0;
 		this._seq = (Math.random() * UINT16) | 0;
 		this._ack = 0;
 		this._synack = null;
 
-		socket.on('listening', function() {
-			self._recvId = socket.address().port; // using the port gives us system wide clash protection
-			self._sendId = uint16(self._recvId + 1);
-			self._sendOutgoing(createPacket(self, PACKET_SYN, null));
-		});
-
-		socket.on('error', function(err) {
-			self.emit('error', err);
-		});
-
-		socket.bind();
+		// For standalone client connections that own their own socket,
+		// we set up the recv id from the bound port.
+		// For connections created through UTPSocket.connect(), the
+		// caller sets _recvId/_sendId before calling _connect().
 	}
 
 	var resend = setInterval(this._resend.bind(this), 500);
@@ -144,7 +152,6 @@ var Connection = function(port, host, socket, syn) {
 
 	this.once('finish', sendFin);
 	this.once('close', function() {
-		if (!syn) setTimeout(socket.close.bind(socket), CLOSE_GRACE);
 		clearInterval(resend);
 		clearInterval(keepAlive);
 	});
@@ -155,8 +162,17 @@ var Connection = function(port, host, socket, syn) {
 
 util.inherits(Connection, Duplex);
 
-Connection.prototype.setTimeout = function() {
-	// TODO: impl me
+Connection.prototype.setContentSize = function(size) {
+	this._contentSize = size;
+};
+
+Connection.prototype.setInteractive = function(interactive) {
+	this._interactive = interactive;
+};
+
+Connection.prototype.setTimeout = function(ms, ontimeout) {
+	// TODO: implement timeout
+	if (ontimeout) this.once('timeout', ontimeout);
 };
 
 Connection.prototype.destroy = function() {
@@ -164,7 +180,7 @@ Connection.prototype.destroy = function() {
 };
 
 Connection.prototype.address = function() {
-	return {port:this.port, address:this.host};
+	return { port: this.port, address: this.host };
 };
 
 Connection.prototype._read = function() {
@@ -234,7 +250,7 @@ Connection.prototype._recvAck = function(ack) {
 	var offset = this._seq - this._inflightPackets;
 	var acked = uint16(ack - offset)+1;
 
-	if (acked >= BUFFER_SIZE) return; // sanity check
+	if (acked >= BUFFER_SIZE) return;
 
 	for (var i = 0; i < acked; i++) {
 		this._outgoing.del(offset+i);
@@ -269,9 +285,9 @@ Connection.prototype._recvIncoming = function(packet) {
 		if (!packet) return;
 	}
 
-	if (uint16(packet.seq - this._ack) >= BUFFER_SIZE) return this._sendAck(); // old packet
+	if (uint16(packet.seq - this._ack) >= BUFFER_SIZE) return this._sendAck();
 
-	this._recvAck(packet.ack); // TODO: other calcs as well
+	this._recvAck(packet.ack);
 
 	if (packet.id === PACKET_STATE) return;
 	this._incoming.put(packet.seq, packet);
@@ -287,7 +303,7 @@ Connection.prototype._recvIncoming = function(packet) {
 };
 
 Connection.prototype._sendAck = function() {
-	this._transmit(createPacket(this, PACKET_STATE, null)); // TODO: make this delayed
+	this._transmit(createPacket(this, PACKET_STATE, null));
 };
 
 Connection.prototype._sendOutgoing = function(packet) {
@@ -304,94 +320,211 @@ Connection.prototype._transmit = function(packet) {
 	this.socket.send(message, 0, message.length, this.port, this.host);
 };
 
+// ---------------------------------------------------------------------------
+// UTPSocket — unified dgram-compatible API
+// ---------------------------------------------------------------------------
 
-var Server = function() {
+var UTPSocket = function(opts) {
+	if (!(this instanceof UTPSocket)) return new UTPSocket(opts);
 	EventEmitter.call(this);
+
 	this._socket = null;
 	this._connections = {};
+	this._bound = false;
+	this._closed = false;
+	this._closing = false;
+	this._refed = true;
+	this._allowHalfOpen = !opts || opts.allowHalfOpen !== false;
 };
 
-util.inherits(Server, EventEmitter);
+util.inherits(UTPSocket, EventEmitter);
 
-Server.prototype.address = function() {
-	return this._socket.address();
+UTPSocket.prototype._ensureSocket = function() {
+	if (this._socket) return;
+	this._socket = dgram.createSocket('udp4');
+	this._attachSocket();
 };
 
-Server.prototype.listenSocket = function(socket, onlistening) {
-	this._socket = socket;
-
-	var connections = this._connections;
+UTPSocket.prototype._attachSocket = function() {
 	var self = this;
+	var connections = this._connections;
 
-	socket.on('message', function(message, rinfo) {
-		if (message.length < MIN_PACKET_SIZE) return;
-		var packet = bufferToPacket(message);
-		var id = rinfo.address+':'+(packet.id === PACKET_SYN ? uint16(packet.connection+1) : packet.connection);
+	this._socket.on('message', function(message, rinfo) {
+		// Try to route as UTP
+		if (isUTPPacket(message)) {
+			var packet = bufferToPacket(message);
+			var id = rinfo.address + ':' + (packet.id === PACKET_SYN ? uint16(packet.connection+1) : packet.connection);
 
-		if (connections[id]) return connections[id]._recvIncoming(packet);
-		if (packet.id !== PACKET_SYN || self._closed) return;
+			if (connections[id]) {
+				connections[id]._recvIncoming(packet);
+				return;
+			}
 
-		connections[id] = new Connection(rinfo.port, rinfo.address, socket, packet);
-		connections[id].on('close', function() {
-			delete connections[id];
-		});
+			if (packet.id === PACKET_SYN && !self._closed) {
+				var conn = new Connection(rinfo.port, rinfo.address, self._socket, packet, self._allowHalfOpen);
+				connections[id] = conn;
+				conn.on('close', function() {
+					delete connections[id];
+					if (self._closing) self._closeMaybe();
+				});
+				self.emit('connection', conn);
+				return;
+			}
+		}
 
-		self.emit('connection', connections[id]);
+		// Not a UTP packet (or unroutable) — emit as raw datagram
+		self.emit('message', message, { address: rinfo.address, port: rinfo.port });
 	});
 
-	socket.once('listening', function() {
+	this._socket.on('error', function(err) {
+		self.emit('error', err);
+	});
+
+	this._socket.on('close', function() {
+		self.emit('close');
+	});
+};
+
+UTPSocket.prototype.address = function() {
+	if (!this._socket || !this._bound) throw new Error('Socket not bound');
+	var addr = this._socket.address();
+	return { address: addr.address, port: addr.port };
+};
+
+UTPSocket.prototype.bind = function(port, host, onlistening) {
+	if (typeof port === 'function') return this.bind(0, null, port);
+	if (typeof host === 'function') return this.bind(port, null, host);
+	if (!port) port = 0;
+
+	var self = this;
+
+	this._ensureSocket();
+
+	if (onlistening) this.once('listening', onlistening);
+
+	this._socket.once('listening', function() {
+		self._bound = true;
 		self.emit('listening');
 	});
 
-	if (onlistening) self.once('listening', onlistening);
-}
-
-Server.prototype.listen = function(port, onlistening) {
-	if (typeof port === 'object' && typeof port.on === 'function') return this.listenSocket(port, onlistening);
-	var socket = dgram.createSocket('udp4');
-	this.listenSocket(socket, onlistening);
-	socket.bind(port);
+	if (host) {
+		this._socket.bind(port, host);
+	} else {
+		this._socket.bind(port);
+	}
 };
 
-Server.prototype.close = function(cb) {
-	var self = this;
-	var openConnections = 0;
-	this._closed = true;
+UTPSocket.prototype.listen = function(port, host, onlistening) {
+	if (!this._bound) this.bind(port, host, onlistening);
+	else if (onlistening) process.nextTick(onlistening);
+};
 
-	function onClose() {
-		if (--openConnections === 0) {
-			if (self._socket) self._socket.close();
-			if (cb) cb();
+UTPSocket.prototype.connect = function(port, host) {
+	if (!host) host = '127.0.0.1';
+	if (!this._bound) this.bind(0);
+
+	var self = this;
+	var conn = new Connection(port, host, null, null, this._allowHalfOpen);
+
+	// We need to wait until the socket is bound so we can derive connection ids
+	// from the local port, then wire the connection to use our shared socket.
+	function setupConnection() {
+		var localPort = self._socket.address().port;
+		conn._recvId = localPort;
+		conn._sendId = uint16(localPort + 1);
+		conn.socket = self._socket;
+
+		// Register so incoming packets route to this connection
+		var id = host + ':' + conn._recvId;
+		self._connections[id] = conn;
+		conn.on('close', function() {
+			delete self._connections[id];
+			if (self._closing) self._closeMaybe();
+		});
+
+		conn._sendOutgoing(createPacket(conn, PACKET_SYN, null));
+	}
+
+	if (this._bound) {
+		process.nextTick(setupConnection);
+	} else {
+		this.once('listening', setupConnection);
+	}
+
+	return conn;
+};
+
+UTPSocket.prototype.send = function(buf, offset, len, port, host, callback) {
+	if (!callback) callback = noop;
+	if (!this._bound) this.bind(0);
+
+	var self = this;
+
+	function doSend() {
+		if (self._closed || self._closing) {
+			return process.nextTick(callback, new Error('Socket is closed'));
+		}
+		self._socket.send(buf, offset, len, port, host, callback);
+	}
+
+	if (this._bound) {
+		doSend();
+	} else {
+		this.once('listening', doSend);
+	}
+};
+
+UTPSocket.prototype.close = function(cb) {
+	if (this._closed) {
+		if (cb) process.nextTick(cb);
+		return;
+	}
+	if (cb) this.once('close', cb);
+	this._closing = true;
+	this._closeMaybe();
+};
+
+UTPSocket.prototype._closeMaybe = function() {
+	if (!this._closing) return;
+
+	var hasOpen = false;
+	for (var id in this._connections) {
+		if (!this._connections[id]._closed) {
+			hasOpen = true;
+			this._connections[id].end();
 		}
 	}
 
-	for (var id in this._connections) {
-		if (this._connections[id]._closed) continue;
-		openConnections++;
-		this._connections[id].once('close', onClose);
-		this._connections[id].end();
+	if (!hasOpen) {
+		this._closed = true;
+		this._closing = false;
+		if (this._socket) {
+			this._socket.close();
+		} else {
+			var self = this;
+			process.nextTick(function() { self.emit('close'); });
+		}
 	}
 };
 
-exports.createServer = function(onconnection) {
-	var server = new Server();
-	if (onconnection) server.on('connection', onconnection);
-	return server;
+UTPSocket.prototype.ref = function() {
+	this._refed = true;
+	if (this._socket) this._socket.ref();
 };
 
-exports.connect = function(port, host) {
-	var socket = dgram.createSocket('udp4');
-	var connection = new Connection(port, host || '127.0.0.1', socket, null);
-
-	socket.on('message', function(message) {
-		if (message.length < MIN_PACKET_SIZE) return;
-		var packet = bufferToPacket(message);
-
-		if (packet.id === PACKET_SYN) return;
-		if (packet.connection !== connection._recvId) return;
-
-		connection._recvIncoming(packet);
-	});
-
-	return connection;
+UTPSocket.prototype.unref = function() {
+	this._refed = false;
+	if (this._socket) this._socket.unref();
 };
+
+// ---------------------------------------------------------------------------
+// Module export — factory function
+// ---------------------------------------------------------------------------
+
+function noop() {}
+
+function utp(opts) {
+	return new UTPSocket(opts);
+}
+
+module.exports = utp;
